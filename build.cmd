@@ -8,10 +8,10 @@ set LINK=/errorReport:none /INCREMENTAL:NO
 
 if not "%1"=="" goto %1
 
-:cdecrypt
+:wuptool
 echo.
-set APP_NAME=cdecrypt
-cl.exe %APP_NAME%.c util.c aes.c sha1.c /Fe%APP_NAME%.exe
+set APP_NAME=wuptool
+cl.exe %APP_NAME%.c cpack.c util.c aes.c sha1.c /Fe%APP_NAME%.exe
 if %ERRORLEVEL% neq 0 goto out
 echo =^> %APP_NAME%.exe
 if not "%1"=="" goto out
