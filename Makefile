@@ -5,7 +5,7 @@ else
 endif
 
 BIN=cdecrypt
-SRC=${BIN}.c util.c aes.c sha1.c
+SRC=${BIN}.c cpack.c util.c aes.c sha1.c
 OBJ=${SRC:.c=.o}
 DEP=${SRC:.c=.d}
 

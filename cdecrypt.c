@@ -172,7 +172,7 @@ struct FEntry
 
 // Forward declarations
 static void write_json_string(FILE* f, const char* str);
-static bool write_metadata_json(const char* dst_dir, TitleMetaData* tmd);
+static bool write_metadata_json(const char* dst_dir, TitleMetaData* tmd, uint8_t* tik);
 
 static void add_file_meta(const char* path, uint32_t content_id, uint16_t flags,
                           uint64_t offset, uint32_t size, uint8_t is_dir)
@@ -218,7 +218,7 @@ static void write_json_string(FILE* f, const char* str)
     fputc('"', f);
 }
 
-static bool write_metadata_json(const char* dst_dir, TitleMetaData* tmd)
+static bool write_metadata_json(const char* dst_dir, TitleMetaData* tmd, uint8_t* tik)
 {
     char meta_path[PATH_MAX];
     snprintf(meta_path, sizeof(meta_path), "%s%c.title_meta.json", dst_dir, PATH_SEP);
@@ -278,6 +278,15 @@ static bool write_metadata_json(const char* dst_dir, TitleMetaData* tmd)
         fprintf(f, "    }%s\n", (i < file_meta_count - 1) ? "," : "");
     }
     fprintf(f, "  ]\n");
+    
+    // Add encrypted title key from ticket (at offset 0x1BF)
+    if (tik != NULL) {
+        fprintf(f, ",\n  \"encrypted_key\": \"");
+        for (int i = 0; i < 16; i++)
+            fprintf(f, "%02x", tik[0x1BF + i]);
+        fprintf(f, "\"\n");
+    }
+    
     fprintf(f, "}\n");
     
     fclose(f);
@@ -489,15 +498,43 @@ int main_utf8(int argc, char** argv)
     const char* pattern[] = { "%s%c%08x.app", "%s%c%08X.app", "%s%c%08x", "%s%c%08X" };
 
     if (argc < 2) {
-        printf("%s %s - Wii U NUS content file decrypter\n"
+        printf("%s %s - Wii U NUS content file decrypter/packer\n"
             "Copyright (c) 2020-2023 VitaSmith, Copyright (c) 2013-2015 crediar\n"
             "Visit https://github.com/VitaSmith/cdecrypt for official source and downloads.\n\n"
-            "Usage: %s <file or directory>\n\n"
+            "Usage:\n"
+            "  %s <input_dir> [output_dir]  - Decrypt NUS content\n"
+            "  %s pack <input_dir> <output_dir> [common_key] - Pack extracted content\n"
+            "  %s pack <input_dir> <output_dir> - Pack using Wii U common key\n\n"
             "This program is free software; you can redistribute it and/or modify it under\n"
             "the terms of the GNU General Public License as published by the Free Software\n"
             "Foundation; either version 3 of the License or any later version.\n",
-            _appname(argv[0]), APP_VERSION_STR, _appname(argv[0]));
+            _appname(argv[0]), APP_VERSION_STR, _appname(argv[0]), _appname(argv[0]), _appname(argv[0]));
         return EXIT_SUCCESS;
+    }
+
+    // Check for pack subcommand
+    if (strcmp(argv[1], "pack") == 0) {
+        if (argc < 4) {
+            fprintf(stderr, "Usage: %s pack <input_dir> <output_dir> [options]\n", _appname(argv[0]));
+            fprintf(stderr, "Options:\n");
+            fprintf(stderr, "  -k <title_key>    Title key (32 hex chars, required for encryption)\n");
+            fprintf(stderr, "  -c <common_key>   Common key to encrypt title key (32 hex chars, default: Wii U common key)\n");
+            return EXIT_FAILURE;
+        }
+        const char* title_key = NULL;
+        const char* common_key = NULL;
+        
+        // Parse options
+        for (int i = 4; i < argc; i++) {
+            if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
+                title_key = argv[++i];
+            } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+                common_key = argv[++i];
+            }
+        }
+        
+        extern int pack_title(const char* input_dir, const char* output_dir, const char* title_key, const char* common_key);
+        return pack_title(argv[2], argv[3], title_key, common_key);
     }
 
     if (!is_directory(argv[1])) {
@@ -710,7 +747,7 @@ int main_utf8(int argc, char** argv)
     }
     
     // Write metadata JSON for repacking support
-    write_metadata_json(dst_dir, tmd);
+    write_metadata_json(dst_dir, tmd, tik);
     
     r = EXIT_SUCCESS;
 
