@@ -20,6 +20,7 @@
 
 #include <assert.h>
 #include <inttypes.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,6 +51,20 @@ uint8_t         title_id[16];
 uint8_t         title_key[16];
 uint64_t        h0_count = 0;
 uint64_t        h0_fail  = 0;
+
+// Metadata for repacking support
+typedef struct {
+    char path[PATH_MAX];
+    uint32_t content_id;
+    uint16_t flags;
+    uint64_t offset;
+    uint32_t size;
+    uint8_t is_dir;
+} FileMeta;
+
+static FileMeta* file_metas = NULL;
+static uint32_t file_meta_count = 0;
+static uint32_t file_meta_capacity = 0;
 
 #pragma pack(1)
 
@@ -154,6 +169,121 @@ struct FEntry
     uint16_t Flags;
     uint16_t ContentID;
 };
+
+// Forward declarations
+static void write_json_string(FILE* f, const char* str);
+static bool write_metadata_json(const char* dst_dir, TitleMetaData* tmd);
+
+static void add_file_meta(const char* path, uint32_t content_id, uint16_t flags,
+                          uint64_t offset, uint32_t size, uint8_t is_dir)
+{
+    if (file_meta_count >= file_meta_capacity) {
+        uint32_t new_cap = file_meta_capacity == 0 ? 1024 : file_meta_capacity * 2;
+        FileMeta* new_metas = realloc(file_metas, new_cap * sizeof(FileMeta));
+        if (new_metas == NULL)
+            return;
+        file_metas = new_metas;
+        file_meta_capacity = new_cap;
+    }
+    strncpy(file_metas[file_meta_count].path, path, PATH_MAX - 1);
+    file_metas[file_meta_count].path[PATH_MAX - 1] = '\0';
+    file_metas[file_meta_count].content_id = content_id;
+    file_metas[file_meta_count].flags = flags;
+    file_metas[file_meta_count].offset = offset;
+    file_metas[file_meta_count].size = size;
+    file_metas[file_meta_count].is_dir = is_dir;
+    file_meta_count++;
+}
+
+static void write_json_string(FILE* f, const char* str)
+{
+    fputc('"', f);
+    while (*str) {
+        switch (*str) {
+            case '"':  fprintf(f, "\\\""); break;
+            case '\\': fprintf(f, "\\\\"); break;
+            case '\b': fprintf(f, "\\b"); break;
+            case '\f': fprintf(f, "\\f"); break;
+            case '\n': fprintf(f, "\\n"); break;
+            case '\r': fprintf(f, "\\r"); break;
+            case '\t': fprintf(f, "\\t"); break;
+            default:
+                if ((unsigned char)*str < 0x20)
+                    fprintf(f, "\\u%04x", (unsigned char)*str);
+                else
+                    fputc(*str, f);
+        }
+        str++;
+    }
+    fputc('"', f);
+}
+
+static bool write_metadata_json(const char* dst_dir, TitleMetaData* tmd)
+{
+    char meta_path[PATH_MAX];
+    snprintf(meta_path, sizeof(meta_path), "%s%c.title_meta.json", dst_dir, PATH_SEP);
+    
+    FILE* f = fopen_utf8(meta_path, "w");
+    if (f == NULL) {
+        fprintf(stderr, "ERROR: Could not create metadata file '%s'\n", meta_path);
+        return false;
+    }
+    
+    fprintf(f, "{\n");
+    fprintf(f, "  \"title\": {\n");
+    fprintf(f, "    \"title_id\": \"%016" PRIX64 "\",\n", getbe64(&tmd->TitleID));
+    fprintf(f, "    \"title_version\": %u,\n", getbe16(&tmd->TitleVersion));
+    fprintf(f, "    \"title_type\": %u,\n", getbe32(&tmd->TitleType));
+    fprintf(f, "    \"group_id\": %u,\n", getbe16(&tmd->GroupID));
+    fprintf(f, "    \"system_version\": \"%016" PRIX64 "\",\n", getbe64(&tmd->SystemVersion));
+    fprintf(f, "    \"app_type\": %u,\n", getbe32(tmd->Reserved + 6));
+    fprintf(f, "    \"content_count\": %u,\n", getbe16(&tmd->ContentCount));
+    fprintf(f, "    \"boot_index\": %u\n", getbe16(&tmd->BootIndex));
+    fprintf(f, "  },\n");
+    
+    uint16_t content_count = getbe16(&tmd->ContentCount);
+    fprintf(f, "  \"contents\": [\n");
+    for (uint16_t i = 0; i < content_count; i++) {
+        uint32_t id = getbe32(&tmd->Contents[i].ID);
+        uint16_t index = getbe16(&tmd->Contents[i].Index);
+        uint16_t type = getbe16(&tmd->Contents[i].Type);
+        uint64_t size = getbe64(&tmd->Contents[i].Size);
+        bool hashed = (type & 0x0002) != 0;
+        
+        fprintf(f, "    {\n");
+        fprintf(f, "      \"id\": \"%08X\",\n", id);
+        fprintf(f, "      \"index\": %u,\n", index);
+        fprintf(f, "      \"type\": \"%04X\",\n", type);
+        fprintf(f, "      \"hashed\": %s,\n", hashed ? "true" : "false");
+        fprintf(f, "      \"size\": %" PRIu64 ",\n", size);
+        fprintf(f, "      \"hash\": \"");
+        for (int j = 0; j < 32; j++)
+            fprintf(f, "%02x", tmd->Contents[i].SHA2[j]);
+        fprintf(f, "\"\n");
+        fprintf(f, "    }%s\n", (i < content_count - 1) ? "," : "");
+    }
+    fprintf(f, "  ],\n");
+    
+    fprintf(f, "  \"files\": [\n");
+    for (uint32_t i = 0; i < file_meta_count; i++) {
+        fprintf(f, "    {\n");
+        fprintf(f, "      \"path\": ");
+        write_json_string(f, file_metas[i].path);
+        fprintf(f, ",\n");
+        fprintf(f, "      \"content_id\": %u,\n", file_metas[i].content_id);
+        fprintf(f, "      \"flags\": %u,\n", file_metas[i].flags);
+        fprintf(f, "      \"offset\": %" PRIu64 ",\n", file_metas[i].offset);
+        fprintf(f, "      \"size\": %u,\n", file_metas[i].size);
+        fprintf(f, "      \"is_dir\": %s\n", file_metas[i].is_dir ? "true" : "false");
+        fprintf(f, "    }%s\n", (i < file_meta_count - 1) ? "," : "");
+    }
+    fprintf(f, "  ]\n");
+    fprintf(f, "}\n");
+    
+    fclose(f);
+    printf("Metadata saved to: %s\n", meta_path);
+    return true;
+}
 
 static bool file_dump(const char* path, void* buf, size_t len)
 {
@@ -547,6 +677,10 @@ int main_utf8(int argc, char** argv)
             printf("Size:%07X Offset:0x%010" PRIx64 " CID:%02X U:%02X %s\n", getbe32(&fe[i].FileLength),
                 cnt_offset, getbe16(&fe[i].ContentID), getbe16(&fe[i].Flags), &path[short_path]);
 
+            // Record file metadata for repacking
+            add_file_meta(&path[short_path], getbe16(&fe[i].ContentID), getbe16(&fe[i].Flags),
+                          cnt_offset, getbe32(&fe[i].FileLength), fe[i].Type & 0x80 ? 1 : 0);
+
             uint32_t cnt_file_id = getbe32(&tmd->Contents[getbe16(&fe[i].ContentID)].ID);
 
             if (!(fe[i].Type & 0x80)) {
@@ -574,6 +708,10 @@ int main_utf8(int argc, char** argv)
             }
         }
     }
+    
+    // Write metadata JSON for repacking support
+    write_metadata_json(dst_dir, tmd);
+    
     r = EXIT_SUCCESS;
 
 out:
