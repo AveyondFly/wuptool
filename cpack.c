@@ -215,16 +215,27 @@ int encrypt_content_hashed(const char* input_dir, const char* output_dir,
     uint8_t* encrypted_buffer = NULL;
     int ret = -1;
     
-    // Use metadata size for encrypted size (for proper alignment with original)
-    uint32_t encrypted_size = content->size;
+    // Calculate total data size from files assigned to this content
+    // Use updated offsets and sizes from scanning
+    uint32_t total_size = 0;
+    for (uint32_t i = 0; i < info->entry_count; i++) {
+        if (info->entries[i].content_id == content->id && !info->entries[i].is_dir) {
+            uint32_t end = info->entries[i].file_offset + info->entries[i].file_size;
+            if (end > total_size) total_size = end;
+        }
+    }
     
-    // Calculate block count from encrypted size
-    // Each encrypted block is 0x10000 bytes
-    uint32_t block_count = encrypted_size / 0x10000;
+    if (total_size == 0) {
+        // Empty content - still need one block
+        total_size = HASH_BLOCK_SIZE;
+    }
+    
+    // Calculate block count from actual data size
+    // Each encrypted block has 0xFC00 bytes of data
+    uint32_t block_count = (total_size + HASH_BLOCK_SIZE - 1) / HASH_BLOCK_SIZE;
     if (block_count == 0) block_count = 1;
     
     // Allocate data buffer (padded to block boundary)
-    // Each block has 0xFC00 bytes of data
     uint32_t padded_size = block_count * HASH_BLOCK_SIZE;
     data_buffer = calloc(padded_size, 1);
     if (!data_buffer) goto cleanup;
@@ -262,6 +273,9 @@ int encrypt_content_hashed(const char* input_dir, const char* output_dir,
     
     // Copy H3 hash to content info (for TMD)
     memcpy(content->hash, ht->h3, HASH_SIZE);
+    
+    // Update content size to actual encrypted size
+    content->size = block_count * HASH_BLOCK_TOTAL;
     
     // Open output file
     snprintf(output_path, sizeof(output_path), "%s%s%s.app",
@@ -1079,6 +1093,46 @@ int pack_title(const char* input_dir, const char* output_dir, const char* title_
     printf("Title ID: %016" PRIX64 "\n", info.title_id);
     printf("Contents: %u\n", info.content_count);
     printf("Files: %u\n", info.entry_count);
+    
+    // Scan actual file sizes and recalculate offsets
+    // This allows users to modify files and have sizes automatically adjusted
+    printf("Scanning actual file sizes...\n");
+    char input_path[1024];
+    for (uint32_t i = 0; i < info.content_count; i++) {
+        uint64_t cur_offset = 0;
+        
+        for (uint32_t j = 0; j < info.entry_count; j++) {
+            pack_fst_entry* entry = &info.entries[j];
+            
+            if (entry->content_id != info.contents[i].id || entry->is_dir) continue;
+            
+            // Get actual file size
+            snprintf(input_path, sizeof(input_path), "%s%s%s", 
+                     input_dir, PATH_SEP_STR, entry->path);
+            
+            FILE* f = fopen_utf8(input_path, "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                uint32_t actual_size = (uint32_t)ftell(f);
+                fclose(f);
+                
+                if (actual_size != entry->file_size) {
+                    printf("  %s: size changed %u -> %u bytes\n", 
+                           entry->path, entry->file_size, actual_size);
+                    entry->file_size = actual_size;
+                }
+            }
+            
+            // Recalculate offset (aligned to 0x20 as per NUSPacker)
+            entry->file_offset = (uint32_t)cur_offset;
+            cur_offset += (entry->file_size + 0x1F) & ~0x1F;  // Align to 0x20
+        }
+        
+        // Update content size
+        if (cur_offset > 0) {
+            info.contents[i].size = (uint32_t)cur_offset;
+        }
+    };
     
     // Title key is required for encryption
     uint8_t title_key[16];
